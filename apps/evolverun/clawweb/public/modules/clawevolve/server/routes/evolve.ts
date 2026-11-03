@@ -1,3 +1,5 @@
+import { createReferenceMaterialsRouter } from "./reference-materials.js";
+import { ReferenceMaterials, materialTaskId, signedMaterials, referenceMaterialsCommand } from "../services/evolve/reference-materials.js";
 import { createEvolveTaskAccess, isSkillTask } from "./evolve-task-access.js";
 import { teamclawScope, teamclawTaskConfig, matchesSpaceBot } from "../services/evolve/teamclaw-scope.js";
 import type { AisStatusHandler } from "../services/ais/status-handler.js";
@@ -312,6 +314,10 @@ async function signedLoopStageInput(
   input: Record<string, unknown>,
   signer: Pick<ObjectStore, "createSignedUrl">,
 ): Promise<Record<string, unknown>> {
+  if (input.reference_materials) {
+    const taskId = String((input.task as { task_id?: string } | undefined)?.task_id ?? "");
+    input = { ...input, reference_materials: await signedMaterials(input.reference_materials, taskId, signer) };
+  }
   const loop = isRecord(input.loop) ? input.loop : null;
   const feedback = loop && isRecord(loop.user_feedback) ? loop.user_feedback : null;
   const files = feedback && Array.isArray(feedback.files) ? feedback.files : null;
@@ -1068,7 +1074,7 @@ async function createStageExtensionStep(
     stepType: "stage_extension",
     stepNo: Math.max(0, ...existingSteps.map((item) => item.step_no)) + 1,
     roundNo: options.roundNo ?? null,
-    command: stageRuntimeCommand(task.task_id, stepId, "execute"),
+    command: referenceMaterialsCommand(task, stageRuntimeCommand(task.task_id, stepId, "execute")),
   });
   await stageSkillRepo.createExtensionRun({
     stepId,
@@ -1153,8 +1159,8 @@ async function createBuiltinDiagnoseStep(
     publicCommand = withoutDiagnoseApiKey(publicCommand);
     dispatchCommand = withoutDiagnoseApiKey(dispatchCommand);
   }
-  publicCommand = withFrozenSessionIds(publicCommand, config.sessionSource);
-  dispatchCommand = withFrozenSessionIds(dispatchCommand, config.sessionSource);
+  publicCommand = referenceMaterialsCommand(task, withFrozenSessionIds(publicCommand, config.sessionSource));
+  dispatchCommand = referenceMaterialsCommand(task, withFrozenSessionIds(dispatchCommand, config.sessionSource));
   const steps = await repo.listSteps(task.task_id);
   const step = await repo.createStep({
     stepId,
@@ -1205,11 +1211,11 @@ async function createBuiltinHardeningStep(
   if (config.model && !readNodeCommandOption(hardeningTemplate, "model")) {
     hardeningSystemArgs.push(["model", safeBenchCommandValue("model", config.model)]);
   }
-  const command = renderCommand(
+  const command = referenceMaterialsCommand(task, renderCommand(
     hardeningTemplate,
     {},
     hardeningSystemArgs,
-  );
+  ));
   const steps = await repo.listSteps(task.task_id);
   const step = await repo.createStep({
     stepId, taskId: task.task_id, stepType: "hardening",
@@ -1254,11 +1260,11 @@ async function createPlanStep(
       ["run-dir", quoteCommandArgument(`/home/admin/.openclaw/workspace/clawevolve_results/${task.task_id}/diagnose`)],
     );
   }
-  const nextCommand = renderCommand(
+  const nextCommand = referenceMaterialsCommand(task, renderCommand(
     taskConfig?.nodeCommands?.plan ?? "/clawevolve-plan",
     {},
     systemArgs,
-  );
+  ));
   const existingSteps = await repo.listSteps(task.task_id);
   const next = await repo.createStep({
     stepId: nextStepId, taskId: task.task_id, stepType: "plan",
@@ -1313,7 +1319,7 @@ async function createOptimizeStep(
   }
   if (config?.trainBenchOwnerUserId) optimizeSystemArgs.push(["train-bench-owner-id", safeBenchCommandValue("trainOwner", config.trainBenchOwnerUserId)]);
   if (config?.testBenchOwnerUserId) optimizeSystemArgs.push(["test-bench-owner-id", safeBenchCommandValue("testOwner", config.testBenchOwnerUserId)]);
-  const command = renderCommand(nodeOptimize, {}, optimizeSystemArgs);
+  const command = referenceMaterialsCommand(task, renderCommand(nodeOptimize, {}, optimizeSystemArgs));
   const ownerUserId = safeBenchCommandValue("ownerId", config?.ownerUserId ?? task.user_id);
   const commandWithOwner = `${command} --owner-id ${ownerUserId}`;
   const stepNo = Math.max(0, ...existingSteps.map((item) => item.step_no)) + 1;
@@ -1618,8 +1624,10 @@ async function stageRuntimeInput(
       user_feedback: answer.feedback,
     };
   }
+  const referenceMaterials = (parseJson(task.config_json) as Record<string, unknown> | null)?.reference_materials;
   const common = {
     ...(testInput ?? {}),
+    ...(referenceMaterials ? { reference_materials: referenceMaterials } : {}),
     ...(mode === "replace" ? { model: config.model ?? "", command: step.command } : {}),
     task: {
       task_id: task.task_id,
@@ -1842,7 +1850,7 @@ async function createNextStageLoopStep(
       stepType: "stage_extension",
       stepNo: Math.max(0, ...steps.map((item) => item.step_no)) + 1,
       roundNo: step.round_no,
-      command: stageRuntimeCommand(task.task_id, stepId, "execute"),
+      command: referenceMaterialsCommand(task, stageRuntimeCommand(task.task_id, stepId, "execute")),
       ext,
     });
     await stageSkillRepo.createExtensionRun({
@@ -2174,6 +2182,9 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
     spaces: deps.hostSpaces, resolveUserId: resolveRequestUserId,
   });
 
+  const materials = new ReferenceMaterials(artifactStore, artifactUrlStore);
+  router.use(createReferenceMaterialsRouter({ repo, materials, actor: resolveRequestUserId, canRead: canReadTask }));
+
   router.use((req, res, next) => {
     if (!deps.capabilities) { next(); return; }
     const skillPath = /^\/(?:skill-assets|skill-events|skill-task-defaults|spaces)(?:\/|$)/i.test(req.path);
@@ -2343,6 +2354,21 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
 
   router.post(["/diagnoses", "/tasks"], asyncHandler(async (req: Request, res: Response) => {
     if (!repo) { res.status(503).json({ error: "数据库不可用" }); return; }
+    const materialUploadId = req.body?.referenceMaterialsUploadId;
+    let referenceTaskId: string | undefined;
+    if (materialUploadId !== undefined) {
+      if (typeof materialUploadId !== "string" || !((req.body?.taskType === "full" && !req.body?.targetSkillAssetId && !req.body?.input)
+        || req.body?.taskType === "hardening")) {
+        res.status(422).json({ error: "参考材料仅支持 Bot 自进化与 Skill 加固任务" }); return;
+      }
+      try { referenceTaskId = materialTaskId(resolveRequestUserId(req) ?? "", String(req.header("Idempotency-Key") ?? "")); }
+      catch (error) { res.status(Number((error as { status?: number }).status) || 422).json({ error: (error as Error).message }); return; }
+      const existing = await repo.findTask(referenceTaskId);
+      if (existing) {
+        if (existing.created_by !== resolveRequestUserId(req)) { res.status(403).json({ error: "任务创建身份不一致" }); return; }
+        res.json({ ...publicTask(existing as unknown as Record<string, unknown>, await repo.listSteps(referenceTaskId)), idempotent: true }); return;
+      }
+    }
     const discriminatedInput = isRecord(req.body?.input) ? req.body.input : null;
     if (discriminatedInput?.type === "insight_improvement") {
       if (!insightTaskService) {
@@ -2649,7 +2675,7 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
         res.status(409).json({ code: "IMPROVEMENT_STATE_CONFLICT", error: message }); return;
       }
     }
-    const taskId = evolveTaskId();
+    const taskId = referenceTaskId ?? evolveTaskId();
     const stepId = id("STEP");
     const clawwebUrl = getClawWebPublicBaseUrl();
     const enabledNodeKeys = (["diagnose", "hardening", "plan", "optimize"] as const)
@@ -2707,7 +2733,13 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
     } catch (error) {
       res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); return;
     }
+    let referenceMaterials;
+    if (materialUploadId !== undefined) {
+      try { referenceMaterials = await materials.bind(resolveRequestUserId(req)!, materialUploadId, taskId); }
+      catch (error) { res.status(Number((error as { status?: number }).status) || 503).json({ error: (error as Error).message }); return; }
+    }
     const config = {
+      ...(referenceMaterials ? { reference_materials: referenceMaterials } : {}),
       flow: freezeEvolutionFlow(flow, stageSelection),
       ...(presentation ? { presentation } : {}),
       ...(taskType === "full" ? { inputMode } : {}),
@@ -2732,12 +2764,20 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
       ...(hasEnabledStageExtensions(stageExtensions) ? { stageExtensions } : {}),
       ...(targetSkill ? { targetSkill } : {}),
     };
-    await repo.createTask({
-      taskId, taskType, userId: String(userId), botId: String(botId),
-      taskName: String(taskName).trim(), remark: String(remark ?? "").trim() || null,
-      configJson: JSON.stringify(teamclawTaskConfig(req, config)), createdBy: improvementActorUserId ?? String(req.header("X-User-Id") || userId),
-      auditActorId: improvementActorUserId ?? resolveRequestUserId(req) ?? String(userId),
-    });
+    try {
+      await repo.createTask({
+        taskId, taskType, userId: String(userId), botId: String(botId),
+        taskName: String(taskName).trim(), remark: String(remark ?? "").trim() || null,
+        configJson: JSON.stringify(teamclawTaskConfig(req, config)), createdBy: improvementActorUserId ?? (referenceTaskId ? resolveRequestUserId(req)! : String(req.header("X-User-Id") || userId)),
+        auditActorId: improvementActorUserId ?? resolveRequestUserId(req) ?? String(userId),
+      });
+    } catch (error) {
+      // A concurrent retry may have committed the same material Task. Only
+      // that winning request is allowed to create and dispatch its first Step.
+      const existing = referenceTaskId ? await repo.findTask(referenceTaskId) : null;
+      if (!existing || existing.created_by !== resolveRequestUserId(req)) throw error;
+      res.json({ ...publicTask(existing as unknown as Record<string, unknown>, await repo.listSteps(existing.task_id)), idempotent: true }); return;
+    }
     if (improvementId !== null && improvementRequestId && improvementActorUserId && improvementRepo) {
       try {
         await improvementRepo.linkEvolveTask({
@@ -4948,6 +4988,7 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
       return;
     }
     const taskConfig = (parseJson(task.config_json) as Record<string, unknown> | null) ?? {};
+    const deliveredMaterials = taskConfig.reference_materials ? await materials.stepInput(taskConfig.reference_materials, task.task_id) : null;
     const planDiagnose = previous.filter((item) => item.step_type === "diagnose" && item.status === "succeeded").at(-1);
     const sourceTaskIds = step.step_type === "optimize"
       ? ((taskConfig.sourceDiagnosisTaskIds as string[] | undefined) ?? [task.task_id])
@@ -4972,6 +5013,7 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
       : undefined;
     res.json({
       protocolVersion: "1.0",
+      ...(deliveredMaterials ? { reference_materials: deliveredMaterials } : {}),
       ...(step.step_type === "hardening" && stageSkillRepo ? {
         businessInput: await signedLoopStageInput(
           await stageRuntimeInput(repo, stageSkillRepo, task, step, "hardening", "replace", null, skillPackages),

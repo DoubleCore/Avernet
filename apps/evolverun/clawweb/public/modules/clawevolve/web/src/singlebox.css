@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "@avernet/clawweb-shared/theme.css";
 @source "../../../../shared/web";
 
 :root {
