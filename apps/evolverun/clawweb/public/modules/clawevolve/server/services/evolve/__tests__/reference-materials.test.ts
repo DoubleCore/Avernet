@@ -48,6 +48,15 @@ describe("task reference materials", () => {
     await expect(buildMaterials(await archive({ "huge.txt": "a".repeat(10000) }, "DEFLATE"))).rejects.toThrow();
     await expect(buildMaterials(await archive(Object.fromEntries(Array.from({ length: 501 }, (_, i) => [`f${i}`, ""]))))).rejects.toThrow(/数量/);
   });
+  it("classifies corrupt CRC and invalid UTF-8 names as invalid user input", async () => {
+    const raw = await archive({ "a.txt": "abc" });
+    const corrupt = Buffer.from(raw); corrupt[35] ^= 1;
+    await expect(buildMaterials(corrupt)).rejects.toMatchObject({ status: 422 });
+    const invalid = Buffer.from(raw); invalid[30] = 0xff;
+    const directory = invalid.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    invalid[directory + 46] = 0xff;
+    await expect(buildMaterials(invalid)).rejects.toMatchObject({ status: 422 });
+  });
   it("freezes a compact Task-specific reference and signs the exact stored package", async () => {
     const { materials, store, objects } = storage();
     const upload = await materials.upload("owner", await archive({ "规则/日报.md": "按部门汇报" }));

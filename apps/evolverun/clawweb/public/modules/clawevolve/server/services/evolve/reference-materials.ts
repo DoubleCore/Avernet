@@ -58,7 +58,9 @@ function inspectDirectory(raw: Buffer): string[] {
       || raw.readUInt32LE(cursor + 38) & 0x10 || local + 30 > start
       || raw.readUInt32LE(local) !== 0x04034b50) throw materialError("材料包包含非法文件或不支持的 ZIP 格式");
     const nameBytes = raw.subarray(cursor + 46, cursor + 46 + nameLength);
-    const name = new TextDecoder("utf-8", { fatal: true }).decode(nameBytes);
+    let name: string;
+    try { name = new TextDecoder("utf-8", { fatal: true }).decode(nameBytes); }
+    catch { throw materialError("材料文件名必须为有效 UTF-8"); }
     materialPath(name);
     const localNameSize = raw.readUInt16LE(local + 26);
     const dataStart = local + 30 + localNameSize + raw.readUInt16LE(local + 28);
@@ -79,7 +81,9 @@ function inspectDirectory(raw: Buffer): string[] {
 
 export async function buildMaterials(raw: Buffer) {
   const names = inspectDirectory(raw);
-  const input = await JSZip.loadAsync(raw, { checkCRC32: true });
+  let input: JSZip;
+  try { input = await JSZip.loadAsync(raw, { checkCRC32: true }); }
+  catch { throw materialError("材料 ZIP 损坏或文件校验失败"); }
   if (Object.keys(input.files).length !== names.length) throw materialError("材料目录存在重复或非法条目");
   const zip = new JSZip(), files: MaterialFile[] = [];
   for (const path of names) {
